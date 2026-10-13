@@ -1,140 +1,105 @@
 # PayGuard
 
-**Real-time transaction risk & anomaly detection engine for payment systems.**
+**Real-time transaction risk engine for payment systems.**
 
-PayGuard evaluates every payment before money moves. It returns an explainable decision — `APPROVE`, `REVIEW`, or `BLOCK` — along with the exact features and rules that drove the outcome. Designed to sit in the critical path of a payment flow with strict latency budgets.
+PayGuard har payment se pehle ek explainable decision deta hai: `ALLOW`, `STEP_UP`, `REVIEW`, ya `BLOCK`. Saath mein woh features aur rules jo decision ke peeche the.
 
-Built for teams that need production-grade risk controls without the complexity of a full ML platform.
+Do problems pe focused hai, generic "5 payments in a minute" demo nahi:
 
----
+- **Mule / layering** — dormant account, phir tez fan-in aur fan-out
+- **Device aur session** — binding, integrity, SIM cooling, proxy/datacenter, screen-share
 
-## Why this exists
+Machine learning is version mein nahi hai. Pehle features, rules, aur audit solid hone chahiye.
 
-Most open-source fraud demos stop at a few hardcoded velocity checks. Real payment systems need more:
-
-- Consistent real-time features under concurrent load
-- Behavioral baselines that actually reflect the user
-- Lightweight graph signals to catch shared devices and simple collusion patterns
-- Fully explainable decisions (required for compliance and dispute handling)
-- A feedback loop so chargebacks and manual reviews improve the system over time
-- Operational readiness: metrics, tracing, graceful degradation, Kubernetes deployment
-
-PayGuard focuses on those problems.
+Design, rules, aur pehla demo scene: [DESIGN.md](DESIGN.md).
 
 ---
 
-## Core Capabilities
+## Kya cover hai
 
-### Real-time Feature Engine
-- Sliding-window velocity (count + amount) across 1 min / 5 min / 1 hour / 24 hour windows
-- Unique entity counts (merchants, devices, IPs, locations) inside each window
-- Per-user behavioral baselines: average amount, typical transaction hours, preferred merchants
-- Time-since-last-transaction, new-device and new-IP flags, geographic jump detection
-- Lightweight graph signals:
-  - Shared device / phone / IP across users
-  - Fan-out and fan-in patterns
-  - Basic cycle detection (A → B → C → A)
+### Paisa ka flow
+- Dormant gap, inbound fan-in, outbound fan-out, pass-through ratio
+- Beneficiary first-seen age
+- 1–2 hop tak `BAD` list se rishta
+- User baseline: usual amount, hours, pehle ke payees
 
-### Configurable Rules Engine
-- Versioned, hot-reloadable rules (JSON/YAML)
-- Weighted scoring with severity levels (LOW / MEDIUM / HIGH / CRITICAL)
-- Rich rule types covering velocity, amount deviation, entity uniqueness, graph signals, and sequence patterns
-- Every decision returns the exact list of fired rules plus the feature values that triggered them
+### Device binding
+- Device key se signed request. Private key secure hardware mein
+- SIM / app reinstall pe `COOLING`, "logout all" pe `REVOKED`
+- Invalid signature ya revoked binding → `BLOCK`
 
-### Decision Service
-- Final output: decision (`APPROVE` / `REVIEW` / `BLOCK`) + numeric risk score + full explanation
-- Two operating modes:
-  - **Blocking** — can stop the payment
-  - **Non-blocking** — flag only (useful for gradual rollout)
-- Idempotent scoring: the same transaction always produces the same decision
+### Fingerprint, integrity, network
+- Fingerprint drift signal hai, identity nahi. Akela block nahi karta
+- Play Integrity / App Attest verdict. Client ka "not rooted" kaafi nahi
+- Emulator, accessibility / screen-share, datacenter · VPN · TOR
+- Session time aur PIN time (script vs remote-assist)
 
-### Feedback Loop
-- Ingest chargebacks, user-reported scams, and manual review outcomes
-- Track false-positive rate per rule
-- Enable / disable rules or adjust thresholds based on real outcomes
-- Historical replay to back-test rule changes safely
+### Decision
+- `ALLOW` · `STEP_UP` · `REVIEW` · `BLOCK`
+- Pre-debit sync (p95 &lt; 40 ms) aur post-pattern async
+- Idempotent: same payment, same decision
 
-### Operational Features
-- gRPC interface for low-latency integration with payment services
-- OpenTelemetry tracing and Prometheus metrics (latency, decision distribution, false-positive rate, feature computation time)
-- Full audit log of every decision
-- Graceful degradation when Redis or the feature store is under pressure
-- Kubernetes-ready manifests (Deployments, HPA, readiness/liveness probes, resource limits)
+### Rules jo production mein chalti hain waise
+- `SHADOW` → `CANARY` → `LIVE`
+- Har fire ka input/output audit
+- Historical replay, false-positive count
+- Per-rule block budget. Galat rule poora traffic na roke
+- `BAD` / `GREY` / `TRUSTED` lists. Fuzzy match pe auto-block nahi
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-Payment Service
-      │
-      │  gRPC  (RiskScoreRequest)
+App / checkout
+      │  signed request + device context
       ▼
-┌───────────────────────────────────┐
-│           PayGuard                  │
-│  ┌─────────────┐  ┌──────────────┐  │
-│  │ Feature     │  │ Rules        │  │
-│  │ Engine      │→ │ Engine       │  │
-│  └─────────────┘  └──────────────┘  │
-│         │                │          │
-│         └───────┬────────┘          │
-│                 ▼                   │
-│          Decision Service           │
-│                 │                   │
-│                 ▼                   │
-│          RiskScoreResponse          │
-└─────────────────────────────────────┘
+Decision service  (gRPC, hot path)
+      ├─ binding verify
+      ├─ features (Redis)
+      ├─ rules (versioned YAML)
+      └─ audit (async)
       │
-      │  async feedback events
       ▼
- Feedback Worker  →  Rule adjustments + metrics
+ALLOW | STEP_UP | REVIEW | BLOCK
+
+Async ingest → windows, edges, baselines
+Review worker → analyst labels
 ```
 
-Services communicate over gRPC. Real-time features live in Redis. Baselines, rule versions, feedback, and the full audit trail live in PostgreSQL.
+Redis: windows, first-seen, edges, block budget. PostgreSQL: bindings, lists, baselines, decisions, labels.
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Layer              | Choice                          |
-|--------------------|---------------------------------|
-| Language           | Go                              |
-| Inter-service      | gRPC + Protocol Buffers         |
-| Real-time features | Redis (sliding windows + sets)  |
-| Persistent store   | PostgreSQL                      |
-| Observability      | OpenTelemetry → Prometheus      |
-| Deployment         | Kubernetes                      |
-
----
-
-## Project Status
-
-This repository is under active development. The current focus is:
-
-1. Feature computation service with correct sliding-window semantics
-2. Rules engine with hot reload and full explainability
-3. gRPC decision endpoint
-4. Feedback ingestion and false-positive tracking
-5. Kubernetes manifests and observability
-
-Daily progress is pushed to this repository.
+| Layer | Choice |
+| --- | --- |
+| Language | Go |
+| RPC | gRPC + Protocol Buffers |
+| Hot features | Redis |
+| Durable state | PostgreSQL |
+| Observability | OpenTelemetry, Prometheus |
+| Deploy | Kubernetes |
 
 ---
 
-## Design Principles
+## Status
 
-- **Latency first** — target p95 under 40 ms for a complete score
-- **Explainability is non-negotiable** — every decision must be auditable
-- **Features before models** — a solid feature and rules foundation comes first
-- **Fail safe** — when in doubt, the system degrades gracefully instead of blocking legitimate traffic or going silent
-- **Operationally honest** — metrics and tracing are part of the core design, not an afterthought
+Design lock hai, implementation abhi shuru nahi hui. Order [DESIGN.md](DESIGN.md) ke end mein hai. Pehla goal: mule scene ka integration test, rules `SHADOW` se.
+
+---
+
+## Design principles
+
+- Latency pehle. Pre-debit p95 40 ms.
+- Har decision audit ho sake. Score akela kaafi nahi.
+- Block last resort hai. Step-up aur review pehle.
+- Client jo bole use tab maan-o jab attestation ya signature ho.
+- Ek rule ko poora system rokne mat do.
 
 ---
 
 ## License
 
 MIT
-
----
-
-Built for real payment systems. Feedback and contributions welcome.
