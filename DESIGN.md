@@ -1,256 +1,299 @@
-# PayGuard — Design
+# PayGuard — API and decision design
 
-Yeh document batata hai PayGuard **kya** karta hai, **kyun**, aur pehla version **kaise** banega. Marketing page nahi hai. Jo yahan nahi likha, voh pehle release ka hissa nahi hai.
+PayGuard is a risk API for fintech organizations: payment service providers, banks, wallets, and merchant platforms. The caller sends a payment intent. PayGuard returns an action and the evidence behind it. The caller enforces that action in its own payment flow.
 
-Stack: Go, gRPC, Redis, PostgreSQL, Kubernetes. Machine learning is release mein nahi hai.
+PayGuard does not hold customer balances, does not submit transactions to a scheme or to UPI, and does not replace the caller's fraud operations team. It is the decision and audit layer those systems call.
+
+This release has no machine-learning model. Rules are versioned, replayable, and bounded so a bad deploy cannot take down a caller's authorization rate.
+
+Stack: Go, gRPC, Redis, PostgreSQL, Kubernetes. An HTTPS gateway exposes the same contract to callers that do not use gRPC.
+
+---
+
+## Who calls the API
+
+| Caller | What they send | What they do with the result |
+| --- | --- | --- |
+| PSP or payment gateway | Intent before authorization | Allow, challenge, queue, or decline |
+| Bank or UPI app backend | Debit before the debit is sent | Step-up, hold for review, or stop |
+| Wallet or merchant platform | Payout or peer transfer | Same action set, their own UX |
+
+Authentication to PayGuard is the organization's API credential, separate from the end-user device signature. Tenant isolation is mandatory: features, lists, rules, and audit rows never cross organization boundaries.
 
 ---
 
 ## Problem
 
-Payment fraud ka bada hissa aisi transactions hai jo **technically valid** hoti hain. User ne PIN daala, signature sahi hai, balance hai. Phir bhi paisa fraud hai.
+A large share of payment fraud is technically valid. The user authenticated, the signature checks out, and the balance is sufficient. The payment is still fraud.
 
-Do alag cases hain. Dono ko ek hi "velocity > 5" rule se nahi pakda ja sakta.
+Two cases drive the first release. A single velocity counter does not cover both.
 
-**Mule / layering.** Account hafte bhar se soya hua hai. Phir kuch minute mein kai logon se paise aate hain, aur turant naye UPI IDs pe nikal jaate hain. NPCI isi pattern ko mule account maanti hai: fan-in, phir fan-out, kai hops. Sirf "is user ne aaj 5 payment ki" isse nahi dikhta.
+**Mule and layering.** An account is quiet for weeks. Within minutes it receives funds from many senders and forwards most of that value to new beneficiaries, often across several hops. That is the pattern networks such as NPCI describe for mule accounts: fan-in, then fan-out. "This user made five payments today" does not describe it.
 
-**Device aur session.** Doosra fraud request ke source ka hai. Naya phone, SIM change, emulator, screen-share (AnyDesk / accessibility), datacenter IP se card testing, ya script jo form 200 ms mein bhar de. Ticketmaster jaisa bot detection yahan copy nahi karna. Wahan inventory scraping hai. Yahan paisa move ho raha hai, aur aksar insaan khud PIN daal raha hai kyunki koi call pe guide kar raha hai.
+**Device and session risk.** The request itself is wrong: a new phone, a SIM change, an emulator, an accessibility service used for screen sharing, a datacenter IP running card tests, or a script that completes checkout in a few hundred milliseconds. This is not Ticketmaster-style bot defense. That problem is inventory scraping. Here the question is whether this authenticated payment should move money. Often a person is entering the PIN because someone on a phone call is coaching them.
 
-Teesra constraint: **har risky payment ko BLOCK karna business kharab karta hai.** Razorpay jaise stacks isliye risk-based step-up use karte hain. Low risk seedha jaaye. High risk pe extra confirm. Sirf clear fraud pe block.
+A third constraint comes from production risk stacks (Razorpay's risk-based authentication, Adyen Protect, Stripe Radar): declining every risky payment destroys authorization rate. The API must be able to say "challenge" or "review" without saying "decline".
 
 ---
 
-## Decision
+## API actions
 
-Har score ka output char mein se ek action hai. Sirf number nahi.
+`ScorePayment` returns one action. The score is supporting data, not a substitute for the action.
 
-| Action | Matlab |
+| Action | Meaning for the caller |
 | --- | --- |
-| `ALLOW` | Payment aage badhe |
-| `STEP_UP` | Extra confirm: PIN dobara, cooldown, ya beneficiary naam dikha ke haan | Payment kill nahi |
-| `REVIEW` | Insaan dekhe. Payment hold, TTL ke saath. TTL khatam aur koi decision nahi to fail-safe config se ALLOW ya BLOCK |
-| `BLOCK` | Payment ruke |
+| `ALLOW` | Continue the payment |
+| `STEP_UP` | Require an extra confirmation (re-enter PIN, show the beneficiary name, or apply a short cooldown). Do not kill the payment |
+| `REVIEW` | Hold for a person, with a TTL. If the TTL expires with no label, the caller's configured fail-safe applies: allow or block |
+| `BLOCK` | Do not send the payment |
 
-Har decision ke saath:
+Each response includes:
 
-- numeric score (ordering aur analytics ke liye, action ka substitute nahi)
+- a numeric score, for ordering and analytics only
 - fired rules: id, version, action, reason code
-- un features ki values jinpe rule chala
-- idempotency key. Same payment dobara aaye to same decision, naya side effect nahi
+- the feature values those rules evaluated
+- the idempotency key. A retry of the same intent returns the same decision and does not double-count features
 
-Do modes:
+Two enforcement modes, chosen per organization:
 
-- **blocking** — action payment ko rok sakta hai
-- **non-blocking** — sirf log. Rollout ke waqt pehle yahi
+- **enforcing** — the caller is expected to honor the action
+- **shadow** — PayGuard logs the action and the caller proceeds. Used for the first days of a new tenant or a new rule
 
 ---
 
-## Do decision points
+## Two evaluation points
 
-**Pre-debit (sync, payment ke raste mein).** Payer velocity, device binding, naya beneficiary, amount vs baseline, SIM/integrity. Yahan latency budget tight hai: poora score p95 40 ms ke andar. Yahan se ALLOW, STEP_UP, REVIEW, BLOCK.
+**Pre-debit, synchronous.** On the caller's payment path. Inputs: payer velocity, device binding, new-beneficiary status, amount against baseline, SIM and integrity signals. Latency budget: p95 under 40 ms for the whole `ScorePayment` call. This call may return any of the four actions.
 
-**Post-pattern (async, seconds).** Is payment ke baad graph update: kisne bheja, kahan gaya, kitni der mein. Mule score agle debit pe kaam aayega. Pehli transaction ko late block karke user ka request mat latkao. Jo pehle ho chuka, use REVIEW queue ya agla hop pakdo.
+**Post-pattern, asynchronous.** After the caller reports the outcome. PayGuard updates windows and edges: who paid whom, and how fast funds left. That evidence applies to the next debit. The first request is not held open while the graph updates. A pre-debit `BLOCK` is never overturned by a later async pass. Other actions may become stricter on the next call.
 
-Pre-debit BLOCK ko post-pattern ALLOW override nahi karega. Baaki actions post-pattern evidence se agle request pe sakht ho sakte hain.
+Callers must send an outcome (`completed`, `failed`, `step_up_passed`, `step_up_failed`, `review_fraud`, `review_legit`). Without outcomes, replay and false-positive rates are empty.
 
 ---
 
 ## Features
 
-### Paisa ka flow (mule)
+### Money flow
 
-- Account age, aur last successful payment ke baad kitne din khali (dormant gap)
-- Inbound fan-in: alag payers, last 10 min / 1 hour, count + amount
-- Outbound fan-out: alag beneficiaries, last 10 min / 1 hour
-- Pass-through: last 30 min mein aaya hua amount ka kitna hissa nikal gaya
-- Beneficiary first-seen age. Pehli baar is VPA ko paisa, amount threshold se upar
-- Hop: beneficiary pehle se `BAD` list pe hai, ya uske 1–2 hop pe hai (seedha Redis edges, full graph database nahi)
+- Account age, and days since the last successful payment (dormant gap)
+- Inbound fan-in: distinct payers in 10 minutes and in 1 hour, count and amount
+- Outbound fan-out: distinct beneficiaries in 10 minutes and in 1 hour
+- Pass-through: share of inbound value in the last 30 minutes that has already left
+- Beneficiary first-seen age. First payment to this VPA, above a tenant threshold
+- Hop check: beneficiary is on the tenant's `BAD` list, or within one or two hops of an entity that is. Edges live in Redis. There is no general-purpose graph database in this release
 
-### User baseline
+### Payer baseline
 
-- Usual amount (median, last 30 din)
+- Usual amount (median, trailing 30 days)
 - Usual hours
-- Pehle jise bheja hai, woh set
+- Beneficiaries this payer has already paid
 
-Baseline missing ho (naya user) to rule "deviation" skip kare, dormant/new-beneficiary phir bhi chale.
+If the payer is new, deviation rules do not fire. Dormant-gap and new-beneficiary rules still do.
 
 ### Device binding
 
-Binding identity hai. Fingerprint identity nahi hai.
+Binding is the device identity. The fingerprint is not.
 
-Ek binding:
+A binding record:
 
-- `user_id`
-- `device_id` — app ne banaya, stable id
-- `app_instance_id` — is install ka. Reinstall pe naya
-- `sim_hash` — SIM ka hash. Raw ICCID store nahi
-- `public_key` — private key device ke secure hardware mein (Android Keystore / iOS Secure Enclave)
-- `bound_at`, `state`: `ACTIVE` | `COOLING` | `REVOKED`
+- `user_id` (the caller's user id, scoped to the tenant)
+- `device_id` — stable id generated by the app
+- `app_instance_id` — this install. A reinstall mints a new one
+- `sim_hash` — hash of the SIM identity. Raw ICCID is not stored
+- `public_key` — the private key stays in device secure hardware (Android Keystore or iOS Secure Enclave)
+- `bound_at`
+- `state`: `ACTIVE`, `COOLING`, or `REVOKED`
 
 Flow:
 
-1. Pehli baar user OTP/PIN se bind karta hai. Server public key rakhta hai.
-2. Har payment app request sign karti hai: user, amount, beneficiary, timestamp, nonce. Private key device se bahar nahi jaati.
-3. Server signature verify karta hai. Fail = `BLOCK`.
-4. SIM hash badla, ya naya `app_instance_id` = purani binding `COOLING` (default 24h). Cooling mein naya beneficiary + high amount = `STEP_UP` ya `REVIEW`.
-5. "Sab devices hatao" = saari bindings `REVOKED`.
+1. First bind happens after the caller's own step-up (OTP or PIN). PayGuard stores the public key.
+2. Every `ScorePayment` request is signed over user, amount, beneficiary, timestamp, and nonce. The private key never leaves the device.
+3. PayGuard verifies the signature. Failure yields `BLOCK`.
+4. A changed SIM hash or a new `app_instance_id` moves the binding to `COOLING` (default 24 hours). During cooling, a new beneficiary above the amount threshold yields `STEP_UP` or `REVIEW`.
+5. "Sign out all devices" from the caller sets every binding for that user to `REVOKED`.
 
-### Fingerprint aur integrity
+### Fingerprint and integrity
 
-Fingerprint batata hai environment kaisa hai, "yeh wahi phone hai" prove nahi karta. OS update pe badal jata hai. Isliye fingerprint drift akela `BLOCK` nahi karega.
+The fingerprint describes the environment. It does not prove "this is the same phone" across OS updates, so fingerprint drift alone never returns `BLOCK`.
 
-App se aane wale signals:
+Signals the caller forwards from its app:
 
-- `fp_hash` — model, OS, app version, screen, timezone, language ka hash. Raw IMEI nahi.
-- `fp_drift` — `SAME` | `DRIFT` | `NEW` pichhli successful payment ke against
-- `integrity` — Play Integrity ya App Attest ka server-side verdict: `PASS` | `FAIL` | `UNKNOWN`. Client ka "root: false" string kaafi nahi.
+- `fp_hash` — hash of model, OS, app version, screen, timezone, and language. No raw IMEI.
+- `fp_drift` — `SAME`, `DRIFT`, or `NEW` against the last successful payment
+- `integrity` — server-verified Play Integrity or App Attest result: `PASS`, `FAIL`, or `UNKNOWN`. A client string that says "not rooted" is not a pass
 - `emulator`, `rooted`
-- `accessibility_enabled` — screen-share / remote control class ka signal
-- installer: Play Store ya sideload
+- `accessibility_enabled` — screen-share and remote-control class signal
+- installer source: store or sideload
 
-`integrity = FAIL` ya emulator pe payment = `BLOCK`. Accessibility on + naya beneficiary = `STEP_UP`, high amount pe `REVIEW`.
+`integrity = FAIL` or an emulator yields `BLOCK`. Accessibility enabled plus a new beneficiary yields `STEP_UP`, and `REVIEW` when the amount is also high.
 
-### Network aur session
+### Network and session
 
 - IP, country, region
-- ASN class: `RESIDENTIAL` | `DATACENTER` | `VPN` | `TOR` | `UNKNOWN`
-- Is IP pe kitne alag user last 1 hour
-- Geo vs user ka usual region
-- TLS fingerprint (JA3/JA4) jab edge pe mil sake. Claimed client "Android app" ho aur handshake browser-bot jaisa ho to flag
-- `session_ms`: checkout start se pay tak
+- ASN class: `RESIDENTIAL`, `DATACENTER`, `VPN`, `TOR`, or `UNKNOWN`
+- Distinct users on this IP in the last hour (inside the tenant)
+- Whether geo matches the payer's usual region
+- TLS fingerprint (JA3 or JA4) when the caller's edge can supply it. A claimed Android app whose handshake looks like a browser automation stack is a flag
+- `session_ms` — start of checkout to pay
 - `pin_entry_ms`
 
-Datacenter/TOR + chhote repeated attempts = card testing = `BLOCK`. Session 200 ms mein complete = script = `BLOCK` ya `STEP_UP`, rule severity se. PIN bahut slow aur beech mein lamba pause, naya beneficiary ke saath = remote-assist suspect = `STEP_UP`.
+Datacenter or Tor plus a burst of small attempts is card testing and yields `BLOCK`. A session under 300 ms with a new beneficiary is treated as a script. A very slow PIN entry with long pauses, together with a new beneficiary, is treated as possible remote assistance and yields `STEP_UP`.
 
-Web checkout (app nahi) pe extra: `webdriver` / headless flag. Mobile UPI pe yeh weak hai, wahan binding + integrity primary hain.
+On web checkout, not the mobile app, PayGuard also accepts a `webdriver` or headless flag. On a UPI-style mobile app those browser signals are weak. Binding and integrity carry that path.
 
 ### Lists
 
-Exact match: VPA, phone hash, device id.
+Exact match on VPA, phone hash, and device id.
 
-List type: `BAD` | `GREY` | `TRUSTED`.
+List class: `BAD`, `GREY`, or `TRUSTED`.
 
-`BAD` pe pre-debit `BLOCK` ya `REVIEW` (list ke config se). `TRUSTED` payroll VPA pe mule fan-out rule soft ho sakta hai, band nahi. Fuzzy name match sirf review UI ke liye. Fuzzy pe auto-block nahi, warna false positive.
+`BAD` at pre-debit yields `BLOCK` or `REVIEW`, per list configuration. A `TRUSTED` beneficiary (for example a known payroll VPA) may suppress the mule fan-out rule. It cannot suppress signature failure, integrity failure, or a `BAD` hit. Fuzzy name similarity is returned on the review record only. It never auto-blocks.
 
 ---
 
-## Rules ka lifecycle
+## Rule lifecycle
 
-Rule YAML mein, pure: input features → action. Bahar kisi store ko rule khud update nahi karta.
+Rules are YAML, and they are pure: features in, action out. A rule does not write to Redis or Postgres.
 
-State:
-
-| State | Asar |
+| State | Effect |
 | --- | --- |
-| `SHADOW` | Action compute karo, payment mat chhedo. Log mein "hota to yeh hota" |
-| `CANARY` | Chhote hissa traffic pe live action. Block rate cap |
-| `LIVE` | Sab pe |
-| `OFF` | Band |
+| `SHADOW` | Compute the action, do not return it as the enforced action. The audit row records what would have happened |
+| `CANARY` | Enforce on a small share of traffic, with a block-rate cap |
+| `LIVE` | Enforce for the tenant |
+| `OFF` | Not evaluated |
 
-Har execution ka input, output, rule version Postgres mein. Baad mein:
+Every evaluation stores inputs, outputs, and the rule version. From that log an operator can:
 
-- is rule ne kitni baar fire kiya
-- analyst ne kitni baar fraud / legit bola (false positive)
-- replay: kal ki payments pe naya YAML chalao, extra BLOCK/STEP_UP kitne
+- count firings
+- join analyst labels (`review_fraud`, `review_legit`) to estimate false positives
+- replay a candidate YAML against historical payments and see how many extra `BLOCK` and `STEP_UP` results it would have produced
 
-**Blast radius.** Ek rule 5 minute mein configured N se zyada `BLOCK` na kare. Cap ke baad rule apne aap `SHADOW` pe gir jaaye aur alert. Ek galat threshold se poora traffic na ruke.
+**Blast radius.** A rule may not return more than N `BLOCK` actions in five minutes, per tenant. Past the cap, the rule drops to `SHADOW` and an alert fires. One bad threshold must not halt a caller's payments.
 
-Pre-debit pe sirf wahi features jo budget mein aa jayein. Graph hop mahanga ho to pre-debit mein sirf direct `BAD` list, hop depth async.
+On the pre-debit path, only features that fit the latency budget are read. A multi-hop walk that is too slow is limited, at pre-debit, to a direct `BAD` hit. Deeper hops are computed asynchronously and apply on the next call.
 
 ---
 
-## Default rules (pehla set)
+## Initial rule set
 
-Yeh numbers shuruaat hain, config se badlenge. Pehle sab `SHADOW`.
+These thresholds are defaults, overridable per tenant. All of them start in `SHADOW`.
 
 | Id | Condition | Action |
 | --- | --- | --- |
-| `R1` | Signature invalid ya binding `REVOKED` | BLOCK |
-| `R2` | Integrity FAIL ya emulator | BLOCK |
-| `R3` | Datacenter/TOR IP aur 10 min mein 8+ chhote attempts | BLOCK |
-| `R4` | Session < 300 ms aur naya beneficiary | BLOCK |
-| `R5` | Naya device ya cooling, naya VPA, amount > baseline × 3 | STEP_UP |
-| `R6` | Accessibility on aur naya VPA | STEP_UP |
-| `R7` | Dormant > 30 din, phir 10 min mein inbound payers ≥ 5 | STEP_UP |
-| `R8` | Pass-through > 80% aur outbound new VPA ≥ 3, 15 min | REVIEW |
-| `R9` | Beneficiary `BAD` list pe | BLOCK |
-| `R10` | Beneficiary ke 1 hop pe `BAD`, amount > threshold | REVIEW |
+| `R1` | Signature invalid, or binding `REVOKED` | BLOCK |
+| `R2` | Integrity `FAIL`, or emulator | BLOCK |
+| `R3` | Datacenter or Tor IP, and 8 or more small attempts in 10 minutes | BLOCK |
+| `R4` | Session under 300 ms, and a new beneficiary | BLOCK |
+| `R5` | New device or cooling, new VPA, amount above 3× baseline | STEP_UP |
+| `R6` | Accessibility enabled, and a new VPA | STEP_UP |
+| `R7` | Dormant more than 30 days, then 5 or more inbound payers in 10 minutes | STEP_UP |
+| `R8` | Pass-through above 80%, and 3 or more new outbound VPAs within 15 minutes | REVIEW |
+| `R9` | Beneficiary on the `BAD` list | BLOCK |
+| `R10` | Beneficiary is one hop from a `BAD` entity, amount above threshold | REVIEW |
 
-Sabse sakht action jeetega: BLOCK > REVIEW > STEP_UP > ALLOW. TRUSTED list `R8` ko SKIP kar sakti hai, `R1`/`R2`/`R9` ko nahi.
+The strictest action wins: `BLOCK` over `REVIEW` over `STEP_UP` over `ALLOW`. A `TRUSTED` list entry may skip `R8`. It may not skip `R1`, `R2`, or `R9`.
 
 ---
 
-## Pehla end-to-end scene
+## Reference scenario
 
-Yahi demo hai. Isi pe tests.
+This is the first integration test. It is also the scenario used in the API docs.
 
-1. Account 40 din se khali.
-2. 6 minute mein 8 alag payers se ₹2,000–₹5,000 aata hai.
-3. 90% amount 4 naye VPAs pe forward hota hai.
-4. Pehla forward: device ACTIVE, lekin beneficiary naya aur dormant. `R7` + `R5` → `STEP_UP`.
-5. User confirm karta hai. Paisa jaata hai. Async pe fan-in / pass-through update.
-6. Teesra forward: `R8` ab match. State `LIVE` hai to `REVIEW`. `SHADOW` hai to payment jaati hai, log mein REVIEW likha hota.
-7. Decision row mein features, rule ids, binding state. Replay mein `R8` OFF ho to teeno ALLOW.
+1. The account has been idle for 40 days.
+2. Within 6 minutes, eight distinct payers send between 2,000 and 5,000 (currency as provided by the caller).
+3. Ninety percent of that value is forwarded to four new VPAs.
+4. The first forward: binding is `ACTIVE`, but the beneficiary is new and the account is dormant. `R7` and `R5` yield `STEP_UP`.
+5. The caller reports `step_up_passed`. The payment completes. Async ingest updates fan-in and pass-through.
+6. On the third forward, `R8` matches. If `R8` is `LIVE`, the action is `REVIEW`. If `R8` is `SHADOW`, the enforced action stays whatever the live rules say, and the audit row records that `R8` would have reviewed.
+7. The decision row contains feature values, rule ids, and binding state. A replay with `R8` set to `OFF` shows the third forward no longer reviewing because of that rule.
 
 ---
 
 ## Services
 
 ```
-Client (app / checkout)
-    │  gRPC ya gateway REST
-    │  signed request + DeviceContext
-    ▼
-Decision service          ← hot path, p95 < 40 ms
-    ├─ Binding verify
-    ├─ Feature read (Redis)
-    ├─ Rules (in-process, versioned YAML)
-    └─ Audit append (async, payment response ka wait nahi)
-    │
-    ├─ Redis: windows, first-seen, edges, block budget
-    └─ Postgres: bindings, lists, baselines, rule versions,
-                 decisions, review labels
+Caller
+    |  ScorePayment (gRPC or HTTPS)
+    |  API credential + signed device context + intent
+    v
+Decision API                 hot path, p95 < 40 ms
+    |- authenticate tenant
+    |- verify device binding
+    |- read features (Redis)
+    |- evaluate rules (in-process, versioned YAML)
+    |- return action
+    '- append audit asynchronously (not on the critical path)
+
+Redis:    windows, first-seen, edges, per-rule block budget
+Postgres: tenants, bindings, lists, baselines, rule versions,
+          decisions, outcomes, review labels
 
 Ingest (async)
-    payment completed / failed
-    → windows, graph edges, baselines update
+    caller outcome events
+    -> update windows, edges, baselines
 
-Review worker
-    REVIEW queue, analyst label, FP count
+Review API
+    list REVIEW items, accept a label, recompute false-positive counts
 ```
 
-Feature compute aur rule execute alag packages, taaki replay decision service ke bina chal sake.
+Feature computation and rule evaluation are separate packages so replay can run without the decision server.
 
 ---
 
-## Data jo hum nahi rakhte
+## Request and response, conceptual
 
-- Raw ICCID, IMEI, MAC, contacts, SMS
-- Private key
-- Poora PAN / card number. Sirf jo identifier payment service pehle se bheje (token, VPA, hash)
+`ScorePayment` request:
 
-Client ka self-reported "not rooted" bina attestation ke `UNKNOWN` hai, `PASS` nahi.
+- `tenant_id` (from the credential, not from the body alone)
+- `idempotency_key`
+- `intent`: payer id, amount, currency, beneficiary id, channel (`UPI`, `CARD`, `WALLET`, `PAYOUT`)
+- `device`: binding signature, device id, instance id, sim hash match, fingerprint, integrity verdict, emulator, rooted, accessibility, installer
+- `network`: IP, ASN class, geo, TLS fingerprint if present
+- `session`: session duration, PIN duration
+
+Response:
+
+- `action`
+- `score`
+- `rules[]` with id, version, action, reason
+- `features` that were actually read
+- `decision_id` for the later outcome call
+
+`ReportOutcome` carries `decision_id` and one of `completed`, `failed`, `step_up_passed`, `step_up_failed`, `review_fraud`, `review_legit`.
+
+Field-level protobuf definitions land in the next change. This document is the contract those definitions must follow.
 
 ---
 
-## Is release se bahar
+## Data PayGuard does not store
 
-- ML model, training pipeline
-- Full graph database, GNN
-- Merchant website review
-- 3DS / bank ACS ka protocol. Hum `STEP_UP` bolte hain, bank ka screen nahi chalate
-- Ticketmaster-style queue, captcha, proof-of-work
+- Raw ICCID, IMEI, MAC address, contacts, or SMS content
+- Device private keys
+- Full card numbers or government id numbers. Only the identifier the caller already uses (token, VPA, or a hash)
+
+A self-reported "not rooted" flag with no attestation is stored as `UNKNOWN`, never as `PASS`.
+
+---
+
+## Out of scope for this release
+
+- A trained model or a training pipeline
+- A general graph database or a graph neural network
+- Merchant-website review
+- Speaking 3-D Secure or a bank ACS. The API returns `STEP_UP`. The caller runs the challenge
+- Queue tokens, CAPTCHA, or proof-of-work
+- Moving, settling, or reconciling funds
 
 ---
 
 ## Build order
 
-1. Proto: `ScorePayment`, `DeviceContext`, `Binding`, decision enum
+1. Protobuf for `ScorePayment`, `ReportOutcome`, `DeviceContext`, and `Binding`
 2. Redis features: velocity, first-seen, fan-in, fan-out, pass-through
-3. Binding verify + cooling
-4. YAML rules, SHADOW default, blast-radius cap
-5. Audit log + replay command
-6. Upar wala mule scene, integration test
-7. Kubernetes manifests, traces, block-rate metric
+3. Binding verification and cooling
+4. YAML rules, default `SHADOW`, block-budget cap
+5. Audit log and a replay command
+6. Integration test for the reference scenario above
+7. Kubernetes manifests, traces, and a per-tenant block-rate metric
 
-Jab tak scene 6 green na ho, naya feature add nahi karna.
+No further feature work until step 6 is green.

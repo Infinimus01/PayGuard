@@ -1,82 +1,66 @@
 # PayGuard
 
-**Real-time transaction risk engine for payment systems.**
+PayGuard is a real-time payment risk API. A fintech, bank, or payment service provider sends a payment intent and receives an explainable decision before money moves: `ALLOW`, `STEP_UP`, `REVIEW`, or `BLOCK`.
 
-PayGuard har payment se pehle ek explainable decision deta hai: `ALLOW`, `STEP_UP`, `REVIEW`, ya `BLOCK`. Saath mein woh features aur rules jo decision ke peeche the.
+The API is built for organizations that already run payments and need a risk layer they can call, rather than a demo ruleset embedded in one app. Callers keep their own user store, ledger, and checkout. PayGuard scores the intent, records why, and returns an action the caller enforces.
 
-Do problems pe focused hai, generic "5 payments in a minute" demo nahi:
+This version does not use machine learning. Decisions come from versioned rules over real-time features: money-flow patterns, device binding, and network and session signals. Every decision is auditable.
 
-- **Mule / layering** — dormant account, phir tez fan-in aur fan-out
-- **Device aur session** — binding, integrity, SIM cooling, proxy/datacenter, screen-share
-
-Machine learning is version mein nahi hai. Pehle features, rules, aur audit solid hone chahiye.
-
-Design, rules, aur pehla demo scene: [DESIGN.md](DESIGN.md).
+Full specification: [DESIGN.md](DESIGN.md).
 
 ---
 
-## Kya cover hai
+## What the API covers
 
-### Paisa ka flow
-- Dormant gap, inbound fan-in, outbound fan-out, pass-through ratio
-- Beneficiary first-seen age
-- 1–2 hop tak `BAD` list se rishta
-- User baseline: usual amount, hours, pehle ke payees
+**Money-flow risk.** Dormant accounts that suddenly receive funds from many senders and forward them to new beneficiaries. Fan-in, fan-out, pass-through ratio, beneficiary first-seen age, and a one- to two-hop check against known-bad entities.
 
-### Device binding
-- Device key se signed request. Private key secure hardware mein
-- SIM / app reinstall pe `COOLING`, "logout all" pe `REVOKED`
-- Invalid signature ya revoked binding → `BLOCK`
+**Device binding.** Each payment is signed by a key held in device secure hardware. SIM change or reinstall moves the binding to a cooling state. An invalid signature or a revoked binding is a block.
 
-### Fingerprint, integrity, network
-- Fingerprint drift signal hai, identity nahi. Akela block nahi karta
-- Play Integrity / App Attest verdict. Client ka "not rooted" kaafi nahi
-- Emulator, accessibility / screen-share, datacenter · VPN · TOR
-- Session time aur PIN time (script vs remote-assist)
+**Device, integrity, and network signals.** Fingerprint drift, emulator detection, screen-share and accessibility abuse, Play Integrity or App Attest results, datacenter, VPN, and Tor traffic, and session timing. A fingerprint mismatch alone does not block a payment. Attestation failure does.
 
-### Decision
-- `ALLOW` · `STEP_UP` · `REVIEW` · `BLOCK`
-- Pre-debit sync (p95 &lt; 40 ms) aur post-pattern async
-- Idempotent: same payment, same decision
+**Decisioning.** Four actions, not a bare score. A synchronous pre-debit call on the payment path (p95 under 40 ms) and an asynchronous update after the payment settles. Idempotent: the same payment intent returns the same decision.
 
-### Rules jo production mein chalti hain waise
-- `SHADOW` → `CANARY` → `LIVE`
-- Har fire ka input/output audit
-- Historical replay, false-positive count
-- Per-rule block budget. Galat rule poora traffic na roke
-- `BAD` / `GREY` / `TRUSTED` lists. Fuzzy match pe auto-block nahi
+**Rule operations.** Rules ship as `SHADOW`, then `CANARY`, then `LIVE`. Each firing stores inputs and outputs. Operators can replay a rule against historical traffic, measure false positives from analyst labels, and cap how many blocks one rule may issue in a short window.
+
+**Lists.** Exact-match `BAD`, `GREY`, and `TRUSTED` lists for VPAs, phone hashes, and device identifiers. Fuzzy name matches are exposed to reviewers only. They never auto-block.
 
 ---
 
-## Architecture
+## Integration
 
 ```
-App / checkout
-      │  signed request + device context
-      ▼
-Decision service  (gRPC, hot path)
-      ├─ binding verify
-      ├─ features (Redis)
-      ├─ rules (versioned YAML)
-      └─ audit (async)
-      │
-      ▼
+Caller (PSP, bank, wallet, checkout)
+        |
+        |  ScorePayment  (gRPC or HTTPS gateway)
+        |  signed device context + payment intent
+        v
+PayGuard Decision API
+        |
+        v
 ALLOW | STEP_UP | REVIEW | BLOCK
+        + reason codes, rule ids, feature values
 
-Async ingest → windows, edges, baselines
-Review worker → analyst labels
+Caller enforces the action.
+Caller reports the outcome (completed, failed, reviewed).
 ```
 
-Redis: windows, first-seen, edges, block budget. PostgreSQL: bindings, lists, baselines, decisions, labels.
+The caller enforces the action. PayGuard does not move money, does not render a bank authentication screen, and does not replace the caller's ledger.
+
+| Your system | PayGuard |
+| --- | --- |
+| User accounts, KYC, balances | Risk decision and audit |
+| Authorize and capture | `STEP_UP` or `REVIEW` as an instruction |
+| Checkout UI | Device context and binding signatures, verified server-side |
+| Chargebacks and manual review outcomes | Labels that feed false-positive rates and replay |
 
 ---
 
-## Tech stack
+## Stack
 
 | Layer | Choice |
 | --- | --- |
 | Language | Go |
-| RPC | gRPC + Protocol Buffers |
+| API | gRPC, with an HTTPS gateway for callers who do not run gRPC |
 | Hot features | Redis |
 | Durable state | PostgreSQL |
 | Observability | OpenTelemetry, Prometheus |
@@ -86,17 +70,17 @@ Redis: windows, first-seen, edges, block budget. PostgreSQL: bindings, lists, ba
 
 ## Status
 
-Design lock hai, implementation abhi shuru nahi hui. Order [DESIGN.md](DESIGN.md) ke end mein hai. Pehla goal: mule scene ka integration test, rules `SHADOW` se.
+The API contract and decision model are specified in [DESIGN.md](DESIGN.md). Implementation has not started. The first milestone is an integration test of the mule-account scenario, with rules in `SHADOW`.
 
 ---
 
-## Design principles
+## Principles
 
-- Latency pehle. Pre-debit p95 40 ms.
-- Har decision audit ho sake. Score akela kaafi nahi.
-- Block last resort hai. Step-up aur review pehle.
-- Client jo bole use tab maan-o jab attestation ya signature ho.
-- Ek rule ko poora system rokne mat do.
+- The pre-debit call stays on the payment latency budget: p95 under 40 ms.
+- Every decision must be explainable to a reviewer and to the calling organization.
+- `BLOCK` is the last resort. `STEP_UP` and `REVIEW` exist so callers can protect conversion.
+- Client-reported device claims are untrusted until a signature or an attestation says otherwise.
+- One bad rule must not be able to halt a caller's traffic. Block budgets force a rule back to `SHADOW`.
 
 ---
 
