@@ -2,9 +2,9 @@
 
 PayGuard is a real-time payment risk API. A fintech, bank, or payment service provider sends a payment intent and receives an explainable decision before money moves: `ALLOW`, `STEP_UP`, `REVIEW`, or `BLOCK`.
 
-The API is built for organizations that already run payments and need a risk layer they can call, rather than a demo ruleset embedded in one app. Callers keep their own user store, ledger, and checkout. PayGuard scores the intent, records why, and returns an action the caller enforces.
+The caller keeps the app, the ledger, and the checkout. PayGuard scores the intent, records why, and returns an action the caller enforces. If PayGuard does not answer in time, the caller fails open and continues the payment.
 
-This version does not use machine learning. Decisions come from versioned rules over real-time features: money-flow patterns, device binding, and network and session signals. Every decision is auditable.
+v1 decisions are rules, not a model. Every score stores the feature vector exactly as it was scored. Chargebacks, confirmed scams, and reviewer marks attach a label to that vector later. A model can be trained from those rows offline. It is not on the payment path until it has beaten the rules in shadow. A completed payment is not treated as legitimate, and a failed payment is not treated as fraud.
 
 Full specification: [DESIGN.md](DESIGN.md).
 
@@ -20,9 +20,11 @@ Full specification: [DESIGN.md](DESIGN.md).
 
 **Decisioning.** Four actions, not a bare score. A synchronous pre-debit call on the payment path (p95 under 40 ms) and an asynchronous update after the payment settles. Idempotent: the same payment intent returns the same decision.
 
-**Rule operations.** Rules ship as `SHADOW`, then `CANARY`, then `LIVE`. Each firing stores inputs and outputs. Operators can replay a rule against historical traffic, measure false positives from analyst labels, and cap how many blocks one rule may issue in a short window.
+**Rule operations.** Rules ship as `SHADOW`, then `CANARY`, then `LIVE`. Thresholds change without a deploy. Operators can replay a rule against historical traffic. A per-rule block budget forces a runaway rule back to `SHADOW`.
 
-**Lists.** Exact-match `BAD`, `GREY`, and `TRUSTED` lists for VPAs, phone hashes, and device identifiers. Fuzzy name matches are exposed to reviewers only. They never auto-block.
+**Lists.** Exact-match `BAD`, `GREY`, and `TRUSTED` lists. Fuzzy name matches never auto-block.
+
+**A training set, not a live model.** Strong labels only: chargeback, confirmed scam, reviewer fraud, reviewer legit. Weak label: still clean after the dispute window. Everything else stays unlabeled.
 
 ---
 
@@ -31,27 +33,27 @@ Full specification: [DESIGN.md](DESIGN.md).
 ```
 Caller (PSP, bank, wallet, checkout)
         |
-        |  ScorePayment  (gRPC or HTTPS gateway)
-        |  signed device context + payment intent
+        |  POST /v1/score
+        |  API key + idempotency key + signed device context
         v
-PayGuard Decision API
+PayGuard
         |
         v
 ALLOW | STEP_UP | REVIEW | BLOCK
-        + reason codes, rule ids, feature values
+        + reason codes, rule ids, feature values, decision_id
 
-Caller enforces the action.
-Caller reports the outcome (completed, failed, reviewed).
+Caller enforces the action (or ALLOW, if the call times out).
+Caller POST /v1/outcomes with that decision_id.
 ```
-
-The caller enforces the action. PayGuard does not move money, does not render a bank authentication screen, and does not replace the caller's ledger.
 
 | Your system | PayGuard |
 | --- | --- |
-| User accounts, KYC, balances | Risk decision and audit |
+| User accounts, KYC, balances | Risk decision, audit, and the labeled feature row |
 | Authorize and capture | `STEP_UP` or `REVIEW` as an instruction |
-| Checkout UI | Device context and binding signatures, verified server-side |
-| Chargebacks and manual review outcomes | Labels that feed false-positive rates and replay |
+| Checkout and device keys | Signature and attestation checks |
+| Chargebacks and manual review | Labels. Not a training step on the request |
+
+One PostgreSQL database for every tenant, isolated by `tenant_id`. Redis holds short-lived counters only.
 
 ---
 
@@ -60,27 +62,29 @@ The caller enforces the action. PayGuard does not move money, does not render a 
 | Layer | Choice |
 | --- | --- |
 | Language | Go |
-| API | gRPC, with an HTTPS gateway for callers who do not run gRPC |
+| Public API | JSON, `POST /v1/score`, `POST /v1/outcomes` |
 | Hot features | Redis |
-| Durable state | PostgreSQL |
+| System of record | PostgreSQL (UUID keys, `tenant_id` on every row) |
 | Observability | OpenTelemetry, Prometheus |
-| Deploy | Kubernetes |
+| Deploy | Kubernetes, one region |
 
 ---
 
 ## Status
 
-The API contract and decision model are specified in [DESIGN.md](DESIGN.md). Implementation has not started. The first milestone is an integration test of the mule-account scenario, with rules in `SHADOW`.
+The contract is in [DESIGN.md](DESIGN.md). Implementation has not started. v1 is the mule-account test, fail-open behavior, and a frozen feature row that a late fraud label can attach to. No model is served in v1.
 
 ---
 
 ## Principles
 
 - The pre-debit call stays on the payment latency budget: p95 under 40 ms.
-- Every decision must be explainable to a reviewer and to the calling organization.
-- `BLOCK` is the last resort. `STEP_UP` and `REVIEW` exist so callers can protect conversion.
+- If this API is down, the caller's payments still move.
+- Every decision must be explainable. A score alone is not a decision.
+- `BLOCK` is the last resort.
 - Client-reported device claims are untrusted until a signature or an attestation says otherwise.
-- One bad rule must not be able to halt a caller's traffic. Block budgets force a rule back to `SHADOW`.
+- One bad rule must not be able to halt a caller's traffic.
+- The model learns from labels that arrive later, in a batch, per tenant. It does not learn inside the score call.
 
 ---
 

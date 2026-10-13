@@ -4,21 +4,47 @@ PayGuard is a risk API for fintech organizations: payment service providers, ban
 
 PayGuard does not hold customer balances, does not submit transactions to a scheme or to UPI, and does not replace the caller's fraud operations team. It is the decision and audit layer those systems call.
 
-This release has no machine-learning model. Rules are versioned, replayable, and bounded so a bad deploy cannot take down a caller's authorization rate.
+v1 decisions are rules. Rules are versioned, replayable, and bounded so a bad deploy cannot take down a caller's authorization rate. Every score also writes a frozen feature vector. Real labels, which arrive later, attach to that vector. A model is trained from those rows offline. v1 does not serve a model, and it does not learn from a single request.
 
-Stack: Go, gRPC, Redis, PostgreSQL, Kubernetes. An HTTPS gateway exposes the same contract to callers that do not use gRPC.
+Stack: Go, Redis, PostgreSQL, Kubernetes. Customers call JSON over HTTPS. gRPC is internal.
+
+---
+
+## API contract (locked before code)
+
+These choices are part of the product. They are not implementation details.
+
+**Fail open by default.** If PayGuard does not answer within the caller's deadline (about 50 ms), the caller proceeds with `ALLOW` and reports the intent afterward. A tenant may opt into fail closed. If Redis is down, PayGuard itself returns `ALLOW` with reason `degraded` and records that the score was blind. A risk API that can halt a customer's authorization rate will not be adopted.
+
+**Public API is versioned JSON.** `POST /v1/score` and `POST /v1/outcomes`. `/v1` is never broken once a tenant is live. gRPC mirrors the same fields inside the cluster.
+
+**Tenant comes from the credential.** An API key maps to one `tenant_id`. A `tenant_id` in the body is ignored.
+
+**Idempotency key is required.** The same key and the same intent return the stored decision and do not move counters. The same key with a different amount, beneficiary, or payer is `409`.
+
+**Identifiers, not people.** VPA, device id, phone hash, the caller's user id, amount, currency. No name, PAN, card number, SMS, or raw SIM. PayGuard is a processor. The caller is the data fiduciary. Default retention for decisions and outcomes is 180 days, then delete. Redis counters live for hours. Baselines roll for 30 days.
+
+**No mobile SDK in v1.** The caller signs in their app. PayGuard verifies the signature and the attestation result. The signed payload is documented byte for byte.
+
+**Rules are rows.** Thresholds for `R1`–`R10` change without a deploy. New rule code still requires a release. There is no tenant-authored rule language in v1.
+
+**One region.** PostgreSQL, UUID primary keys, `tenant_id` on every row. CockroachDB is a later move, not a requirement. The driver stays Postgres-compatible so the move is not a rewrite.
+
+**Meter every score.** Per tenant, per day: scores, allows, step-ups, reviews, blocks, degraded allows. This is the usage record and the only honest number to show a prospect.
+
+**One database for every tenant.** Do not clone a database per customer. Isolation is `tenant_id` plus credentials. A private cluster is a later contract, not the default.
 
 ---
 
 ## Who calls the API
 
 | Caller | What they send | What they do with the result |
-| --- | --- | --- |
+| --- | --- |
 | PSP or payment gateway | Intent before authorization | Allow, challenge, queue, or decline |
 | Bank or UPI app backend | Debit before the debit is sent | Step-up, hold for review, or stop |
 | Wallet or merchant platform | Payout or peer transfer | Same action set, their own UX |
 
-Authentication to PayGuard is the organization's API credential, separate from the end-user device signature. Tenant isolation is mandatory: features, lists, rules, and audit rows never cross organization boundaries.
+Authentication to PayGuard is the organization's API credential, separate from the end-user device signature. Features, lists, rules, decisions, and training rows never cross organization boundaries unless that tenant has opted into a shared model in writing.
 
 ---
 
@@ -38,7 +64,7 @@ A third constraint comes from production risk stacks (Razorpay's risk-based auth
 
 ## API actions
 
-`ScorePayment` returns one action. The score is supporting data, not a substitute for the action.
+`POST /v1/score` returns one action. The score is supporting data, not a substitute for the action.
 
 | Action | Meaning for the caller |
 | --- | --- |
@@ -63,11 +89,54 @@ Two enforcement modes, chosen per organization:
 
 ## Two evaluation points
 
-**Pre-debit, synchronous.** On the caller's payment path. Inputs: payer velocity, device binding, new-beneficiary status, amount against baseline, SIM and integrity signals. Latency budget: p95 under 40 ms for the whole `ScorePayment` call. This call may return any of the four actions.
+**Pre-debit, synchronous.** On the caller's payment path. Inputs: payer velocity, device binding, new-beneficiary status, amount against baseline, SIM and integrity signals. Latency budget: p95 under 40 ms for the whole score call. This call may return any of the four actions.
 
 **Post-pattern, asynchronous.** After the caller reports the outcome. PayGuard updates windows and edges: who paid whom, and how fast funds left. That evidence applies to the next debit. The first request is not held open while the graph updates. A pre-debit `BLOCK` is never overturned by a later async pass. Other actions may become stricter on the next call.
 
-Callers must send an outcome (`completed`, `failed`, `step_up_passed`, `step_up_failed`, `review_fraud`, `review_legit`). Without outcomes, replay and false-positive rates are empty.
+Callers must send an outcome. Without outcomes, replay, false-positive rates, and any future model are empty.
+
+---
+
+## Labels, and the model that comes later
+
+Completed is not "good." Failed is not "fraud." A payment can complete and still be a mule transfer. A payment can fail because the user had no balance. Training on that pair would teach the model the wrong thing.
+
+What v1 stores, on every score, is a **training row**:
+
+- `decision_id`, `tenant_id`, time
+- the feature vector **as it was at score time**, including missing fields. Later recomputation is forbidden. That is how training and serving drift apart
+- the action the rules returned, the rule versions, and whether the call was `degraded`
+- `label` — null until a real label exists
+- `label_source` and `labeled_at`
+
+A label is attached only by `POST /v1/outcomes` or by a reviewer's decision. Sources, strongest first:
+
+| Source | Label | Strength |
+| --- | --- | --- |
+| Caller reports a chargeback or a confirmed scam | fraud | strong |
+| Reviewer marks `review_fraud` | fraud | strong |
+| Reviewer marks `review_legit` | legit | strong |
+| Customer dispute upheld by the caller | fraud | strong |
+| `completed`, and no fraud label before the tenant's dispute window ends (default 90 days) | legit | weak |
+| `failed` because of insufficient funds, a user cancel, or a technical error | unlabeled | not used |
+| `step_up_failed` | unlabeled | not used. The user may have been legitimate and confused |
+
+Weak labels are down-weighted. They are not treated as proof.
+
+Training, when it starts, is a **batch job on a schedule**, not an update inside `POST /v1/score`. Online updates from one request are how a fraudster poisons the model: they send traffic, feed a label, and move the boundary. A weekly job reads rows whose label landed since the last run, trains or fine-tunes offline, and writes a versioned artifact. The artifact is not on the payment path until it has been shadowed.
+
+The model does not replace rules. The order is:
+
+1. Rules enforce. The row is stored. No model.
+2. A model scores the same frozen features in shadow. We compare it to labels. It cannot `BLOCK` anyone.
+3. If its shadow record is better than the rules on recall without a worse false-positive rate, a rule may *read the model score as one more feature*. `R1`, `R2`, and `R9` (bad signature, failed integrity, bad list) still override the model.
+4. Each tenant's rows train that tenant's model by default. A shared model exists only for tenants that opt in, because one bank's fraud is not another bank's training set unless they agreed.
+
+Fraud labels are late. Chargebacks arrive days or weeks after the score. The join key is `decision_id`. A model that only learns from the same day's successes will look accurate and be useless.
+
+Class balance will be extreme. A training job that samples "all fraud, a capped number of legit" is required. Accuracy is the wrong metric. The metrics are recall on strong-fraud labels, false-positive rate on weak-legit labels, and the extra step-ups a shadow model would have caused.
+
+v1 builds the row, the label join, and the retention delete. It does not build the trainer.
 
 ---
 
@@ -107,7 +176,7 @@ A binding record:
 Flow:
 
 1. First bind happens after the caller's own step-up (OTP or PIN). PayGuard stores the public key.
-2. Every `ScorePayment` request is signed over user, amount, beneficiary, timestamp, and nonce. The private key never leaves the device.
+2. Every score request is signed over user, amount, beneficiary, timestamp, and nonce. The private key never leaves the device.
 3. PayGuard verifies the signature. Failure yields `BLOCK`.
 4. A changed SIM hash or a new `app_instance_id` moves the binding to `COOLING` (default 24 hours). During cooling, a new beneficiary above the amount threshold yields `STEP_UP` or `REVIEW`.
 5. "Sign out all devices" from the caller sets every binding for that user to `REVOKED`.
@@ -165,7 +234,7 @@ Rules are YAML, and they are pure: features in, action out. A rule does not writ
 Every evaluation stores inputs, outputs, and the rule version. From that log an operator can:
 
 - count firings
-- join analyst labels (`review_fraud`, `review_legit`) to estimate false positives
+- join analyst labels to estimate false positives
 - replay a candidate YAML against historical payments and see how many extra `BLOCK` and `STEP_UP` results it would have produced
 
 **Blast radius.** A rule may not return more than N `BLOCK` actions in five minutes, per tenant. Past the cap, the rule drops to `SHADOW` and an alert fires. One bad threshold must not halt a caller's payments.
@@ -179,7 +248,7 @@ On the pre-debit path, only features that fit the latency budget are read. A mul
 These thresholds are defaults, overridable per tenant. All of them start in `SHADOW`.
 
 | Id | Condition | Action |
-| --- | --- | --- |
+| --- | --- |
 | `R1` | Signature invalid, or binding `REVOKED` | BLOCK |
 | `R2` | Integrity `FAIL`, or emulator | BLOCK |
 | `R3` | Datacenter or Tor IP, and 8 or more small attempts in 10 minutes | BLOCK |
@@ -203,9 +272,29 @@ This is the first integration test. It is also the scenario used in the API docs
 2. Within 6 minutes, eight distinct payers send between 2,000 and 5,000 (currency as provided by the caller).
 3. Ninety percent of that value is forwarded to four new VPAs.
 4. The first forward: binding is `ACTIVE`, but the beneficiary is new and the account is dormant. `R7` and `R5` yield `STEP_UP`.
-5. The caller reports `step_up_passed`. The payment completes. Async ingest updates fan-in and pass-through.
+5. The caller reports `step_up_passed`. The payment completes. Async ingest updates fan-in and pass-through. The training row stays unlabeled.
 6. On the third forward, `R8` matches. If `R8` is `LIVE`, the action is `REVIEW`. If `R8` is `SHADOW`, the enforced action stays whatever the live rules say, and the audit row records that `R8` would have reviewed.
-7. The decision row contains feature values, rule ids, and binding state. A replay with `R8` set to `OFF` shows the third forward no longer reviewing because of that rule.
+7. A reviewer later sends `review_fraud`. That outcome sets `label=fraud`, `label_source=reviewer` on the frozen feature vector. It does not retrain anything inline.
+8. The decision row contains feature values, rule ids, and binding state. A replay with `R8` set to `OFF` shows the third forward no longer reviewing because of that rule.
+
+---
+
+## What is stored
+
+One PostgreSQL database, shared by tenants, isolated by `tenant_id`. UUID primary keys. Redis holds only counters that can be rebuilt.
+
+| Record | Store | Contents |
+| --- | --- | --- |
+| Tenant | Postgres | UUID, credential hash, fail-open or fail-closed, review TTL fail-safe, dispute window, retention days |
+| Binding | Postgres | Tenant, user id, device id, install id, SIM hash, public key, state |
+| List entry | Postgres | Tenant, `BAD` / `GREY` / `TRUSTED`, VPA or phone hash or device id |
+| Rule config | Postgres | Tenant, rule id, thresholds, version, `SHADOW` / `CANARY` / `LIVE` / `OFF` |
+| Decision | Postgres | UUID, tenant, idempotency key, intent ids, action, score, rule hits, degraded flag, time |
+| Training row | Postgres | Decision id, feature vector exactly as scored, null label until an outcome attaches one |
+| Outcome | Postgres | Decision id, caller status, label source, time |
+| Baseline | Postgres | Per user, usual amount and hours, trailing 30 days |
+| Usage | Postgres | Per tenant per day: scores, actions, degraded count |
+| Counters | Redis | Fan-in, fan-out, velocity, first-seen, block budget. Hours, not the system of record |
 
 ---
 
@@ -213,41 +302,44 @@ This is the first integration test. It is also the scenario used in the API docs
 
 ```
 Caller
-    |  ScorePayment (gRPC or HTTPS)
-    |  API credential + signed device context + intent
+    |  POST /v1/score
+    |  API key + signed device context + intent + idempotency key
     v
 Decision API                 hot path, p95 < 40 ms
-    |- authenticate tenant
+    |- tenant from the key, never from the body
     |- verify device binding
-    |- read features (Redis)
-    |- evaluate rules (in-process, versioned YAML)
+    |- read features (Redis). If Redis is down: ALLOW, reason degraded
+    |- evaluate rules
     |- return action
-    '- append audit asynchronously (not on the critical path)
+    '- append decision + frozen feature vector (async, not on the wait)
+
+POST /v1/outcomes
+    |- attach label if the status is a real label
+    '- update Redis counters and baselines
 
 Redis:    windows, first-seen, edges, per-rule block budget
-Postgres: tenants, bindings, lists, baselines, rule versions,
-          decisions, outcomes, review labels
+Postgres: tenants, bindings, lists, baselines, rules,
+          decisions, training rows, outcomes, daily usage
 
-Ingest (async)
-    caller outcome events
-    -> update windows, edges, baselines
-
-Review API
-    list REVIEW items, accept a label, recompute false-positive counts
+Later, not on the request:
+    batch trainer reads labeled rows
+    writes a versioned model
+    shadow scorer compares it to labels
+    rules may read that score only after the shadow record holds
 ```
 
 Feature computation and rule evaluation are separate packages so replay can run without the decision server.
 
 ---
 
-## Request and response, conceptual
+## Request and response
 
-`ScorePayment` request:
+`POST /v1/score`
 
-- `tenant_id` (from the credential, not from the body alone)
-- `idempotency_key`
+- Idempotency-Key header
+- API key, mapped to a tenant. Body `tenant_id` is ignored
 - `intent`: payer id, amount, currency, beneficiary id, channel (`UPI`, `CARD`, `WALLET`, `PAYOUT`)
-- `device`: binding signature, device id, instance id, sim hash match, fingerprint, integrity verdict, emulator, rooted, accessibility, installer
+- `device`: binding signature, device id, instance id, sim-hash match, fingerprint, integrity verdict, emulator, rooted, accessibility, installer
 - `network`: IP, ASN class, geo, TLS fingerprint if present
 - `session`: session duration, PIN duration
 
@@ -257,11 +349,14 @@ Response:
 - `score`
 - `rules[]` with id, version, action, reason
 - `features` that were actually read
-- `decision_id` for the later outcome call
+- `decision_id`
+- `degraded` boolean
 
-`ReportOutcome` carries `decision_id` and one of `completed`, `failed`, `step_up_passed`, `step_up_failed`, `review_fraud`, `review_legit`.
+`POST /v1/outcomes`
 
-Field-level protobuf definitions land in the next change. This document is the contract those definitions must follow.
+- `decision_id`
+- `status`: `completed`, `failed`, `step_up_passed`, `step_up_failed`, `review_fraud`, `review_legit`, `chargeback`, `scam_confirmed`
+- `failure_reason` when status is `failed` (`insufficient_funds`, `user_cancelled`, `technical`). Those do not become labels
 
 ---
 
@@ -269,31 +364,35 @@ Field-level protobuf definitions land in the next change. This document is the c
 
 - Raw ICCID, IMEI, MAC address, contacts, or SMS content
 - Device private keys
-- Full card numbers or government id numbers. Only the identifier the caller already uses (token, VPA, or a hash)
+- Full card numbers, names, or government id numbers
+- A model weight updated from a single HTTP request
 
 A self-reported "not rooted" flag with no attestation is stored as `UNKNOWN`, never as `PASS`.
 
 ---
 
-## Out of scope for this release
+## Out of scope for v1
 
-- A trained model or a training pipeline
+- Serving a model, or training inside the score call
+- A shared model across tenants who have not opted in
 - A general graph database or a graph neural network
 - Merchant-website review
 - Speaking 3-D Secure or a bank ACS. The API returns `STEP_UP`. The caller runs the challenge
+- A mobile SDK, a case-management UI, a custom rule language
 - Queue tokens, CAPTCHA, or proof-of-work
 - Moving, settling, or reconciling funds
+- CockroachDB, a second region, SOC 2 paperwork (the data layout is what makes that paperwork possible later)
 
 ---
 
 ## Build order
 
-1. Protobuf for `ScorePayment`, `ReportOutcome`, `DeviceContext`, and `Binding`
-2. Redis features: velocity, first-seen, fan-in, fan-out, pass-through
-3. Binding verification and cooling
-4. YAML rules, default `SHADOW`, block-budget cap
-5. Audit log and a replay command
-6. Integration test for the reference scenario above
-7. Kubernetes manifests, traces, and a per-tenant block-rate metric
+1. `POST /v1/score` and `POST /v1/outcomes`. API key to tenant. Idempotency. Fail-open when Redis is down.
+2. Postgres tables: tenant, binding, decision, training row, outcome, daily usage.
+3. Redis features: velocity, first-seen, fan-in, fan-out, pass-through.
+4. Binding verification and cooling.
+5. `R1`–`R10`, default `SHADOW`, block-budget cap.
+6. Integration test for the reference scenario, including a late `review_fraud` that labels the frozen row and does not change the original action.
+7. Traces, and the per-tenant daily meter.
 
-No further feature work until step 6 is green.
+No model code, and no further product surface, until step 6 is green.
