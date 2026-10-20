@@ -7,11 +7,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Infinimus01/PayGuard/internal/store"
 	"github.com/Infinimus01/PayGuard/internal/tenant"
 )
 
 func testServer() *Server {
-	return New(tenant.Parse("test-key:tenant_a,other-key:tenant_b"))
+	return New(tenant.Parse("test-key:tenant_a,other-key:tenant_b"), store.NewMemory())
 }
 
 func scoreBody() string {

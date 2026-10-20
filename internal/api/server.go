@@ -8,11 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/Infinimus01/PayGuard/internal/store"
 	"github.com/Infinimus01/PayGuard/internal/tenant"
 )
 
@@ -20,24 +21,9 @@ const maxBody = 1 << 20
 
 // Server is the v1 HTTP API.
 type Server struct {
-	keys *tenant.KeyStore
-	now  func() time.Time
-
-	mu        sync.Mutex
-	decisions map[string]storedDecision // decision_id -> row
-	byIdem    map[string]string         // tenant|key -> decision_id
-}
-
-type storedDecision struct {
-	Tenant     string
-	DecisionID string
-	IdemKey    string
-	Intent     intent
-	Action     string
-	Degraded   bool
-	Outcome    string
-	FailReason string
-	CreatedAt  time.Time
+	keys  *tenant.KeyStore
+	store store.Store
+	now   func() time.Time
 }
 
 type intent struct {
@@ -70,13 +56,12 @@ type outcomeRequest struct {
 	FailureReason string `json:"failure_reason,omitempty"`
 }
 
-// New returns an API server. keys maps credentials to tenants.
-func New(keys *tenant.KeyStore) *Server {
+// New returns an API server. keys maps credentials to tenants. decisions persist in st.
+func New(keys *tenant.KeyStore, st store.Store) *Server {
 	return &Server{
-		keys:      keys,
-		now:       time.Now,
-		decisions: make(map[string]storedDecision),
-		byIdem:    make(map[string]string),
+		keys:  keys,
+		store: st,
+		now:   time.Now,
 	}
 }
 
@@ -111,13 +96,14 @@ func (s *Server) score(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	idemSlot := tenantID + "|" + idem
-	if existingID, found := s.byIdem[idemSlot]; found {
-		existing := s.decisions[existingID]
-		if !sameIntent(existing.Intent, req.Intent) {
+	existing, found, err := s.store.FindByIdempotency(r.Context(), tenantID, idem)
+	if err != nil {
+		log.Printf("score lookup: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if found {
+		if !sameIntent(existing.Intent, toStoreIntent(req.Intent)) {
 			writeError(w, http.StatusConflict, "idempotency_key_reused")
 			return
 		}
@@ -125,18 +111,25 @@ func (s *Server) score(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := storedDecision{
-		Tenant:     tenantID,
-		DecisionID: newID(),
-		IdemKey:    idem,
-		Intent:     req.Intent,
-		Action:     "ALLOW",
-		Degraded:   false,
-		CreatedAt:  s.now().UTC(),
+	row := store.Decision{
+		ID:             newID(),
+		TenantID:       tenantID,
+		IdempotencyKey: idem,
+		Intent:         toStoreIntent(req.Intent),
+		Action:         "ALLOW",
+		CreatedAt:      s.now().UTC(),
 	}
-	s.decisions[row.DecisionID] = row
-	s.byIdem[idemSlot] = row.DecisionID
-	writeJSON(w, http.StatusOK, toResponse(row))
+	saved, created, err := s.store.InsertDecision(r.Context(), row)
+	if err != nil {
+		log.Printf("score insert: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if !created && !sameIntent(saved.Intent, row.Intent) {
+		writeError(w, http.StatusConflict, "idempotency_key_reused")
+		return
+	}
+	writeJSON(w, http.StatusOK, toResponse(saved))
 }
 
 func (s *Server) outcome(w http.ResponseWriter, r *http.Request) {
@@ -160,25 +153,21 @@ func (s *Server) outcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	row, found := s.decisions[req.DecisionID]
-	if !found || row.Tenant != tenantID {
+	err := s.store.ReportOutcome(r.Context(), tenantID, req.DecisionID, req.Status, req.FailureReason)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "decision_not_found")
-		return
-	}
-	if row.Outcome != "" && (row.Outcome != req.Status || row.FailReason != req.FailureReason) {
+	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "outcome_already_reported")
-		return
+	case err != nil:
+		log.Printf("outcome: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal")
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{
+			"decision_id": req.DecisionID,
+			"status":      req.Status,
+		})
 	}
-	row.Outcome = req.Status
-	row.FailReason = req.FailureReason
-	s.decisions[row.DecisionID] = row
-	writeJSON(w, http.StatusOK, map[string]string{
-		"decision_id": row.DecisionID,
-		"status":      row.Outcome,
-	})
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -215,12 +204,22 @@ func validateIntent(in intent) error {
 	}
 }
 
-func sameIntent(a, b intent) bool {
+func sameIntent(a, b store.Intent) bool {
 	return a.PayerID == b.PayerID &&
 		a.Amount == b.Amount &&
 		a.Currency == b.Currency &&
 		a.BeneficiaryID == b.BeneficiaryID &&
 		a.Channel == b.Channel
+}
+
+func toStoreIntent(in intent) store.Intent {
+	return store.Intent{
+		PayerID:       in.PayerID,
+		Amount:        in.Amount,
+		Currency:      in.Currency,
+		BeneficiaryID: in.BeneficiaryID,
+		Channel:       in.Channel,
+	}
 }
 
 func validStatus(status string) bool {
@@ -242,13 +241,13 @@ func validFailure(reason string) bool {
 	}
 }
 
-func toResponse(row storedDecision) scoreResponse {
+func toResponse(row store.Decision) scoreResponse {
 	return scoreResponse{
 		Action:     row.Action,
-		Score:      0,
+		Score:      row.Score,
 		Rules:      []struct{}{},
 		Features:   map[string]any{},
-		DecisionID: row.DecisionID,
+		DecisionID: row.ID,
 		Degraded:   row.Degraded,
 	}
 }

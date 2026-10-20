@@ -72,7 +72,7 @@ One PostgreSQL database for every tenant, isolated by `tenant_id`. Redis holds s
 
 ## Status
 
-The contract is in [DESIGN.md](DESIGN.md). Implementation has not started. v1 is the mule-account test, fail-open behavior, and a frozen feature row that a late fraud label can attach to. No model is served in v1.
+The HTTP contract is in the repo: `POST /v1/score`, `POST /v1/outcomes`, tenant authentication, and idempotency. Decisions and outcomes persist in PostgreSQL when `DATABASE_URL` is set (`tenants`, `decisions`, `outcomes`). Rules, Redis, and the mule-account test are next. No model is served.
 
 ---
 
